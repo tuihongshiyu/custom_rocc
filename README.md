@@ -6,4 +6,4 @@
 - CustomRocc.scala
 
 使用方法
-- 将该仓库下的src覆盖到本地，使用命令<make CONFIG=RoccRocketConfig debug>
+- 将该仓库下的src覆盖到本地，使用命令“make CONFIG=RoccRocketConfig debug”
