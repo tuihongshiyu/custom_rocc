@@ -6,6 +6,7 @@ package freechips.rocketchip.tile
 import Chisel._
 import chisel3.util.HasBlackBoxResource
 import chisel3.experimental.IntParam
+import chisel3.experimental.{chiselName, NoChiselNamePrefix}
 
 import freechips.rocketchip.config._
 import freechips.rocketchip.subsystem._
@@ -184,6 +185,195 @@ class AccumulatorExampleModuleImp(outer: AccumulatorExample)(implicit p: Paramet
   io.mem.req.bits.size := log2Ceil(8).U
   io.mem.req.bits.signed := Bool(false)
   io.mem.req.bits.data := Bits(0) // we're not performing any stores...
+  io.mem.req.bits.phys := Bool(false)
+  io.mem.req.bits.dprv := cmd.bits.status.dprv
+}
+
+class VecotrRocc(opcodes: OpcodeSet, val n: Int = 16)(implicit p: Parameters) extends LazyRoCC(opcodes) {
+  override lazy val module = new VecotrRoccModuleImp(this)
+}
+
+@chiselName
+class VecotrRoccModuleImp(outer: VecotrRocc)(implicit p: Parameters) extends LazyRoCCModuleImp(outer)
+    with HasCoreParameters {
+  val regfile = Mem(outer.n, UInt(width = xLen))
+  val busy = Reg(init = Vec.fill(outer.n){Bool(false)})
+
+  val cmd = Queue(io.cmd)
+  val funct = cmd.bits.inst.funct
+  val addr = cmd.bits.rs2(log2Up(outer.n)-1,0)
+  // i r r rs1:target reg rs2:value
+  val doWrite = funct === UInt(0)
+  // r r i rs1:source reg
+  val doRead = funct === UInt(1)
+  // i r r rs1:target reg rs2:source addr
+  val doLoad = funct === UInt(2)
+  // i r r rs1:source reg rs2:target addr
+  val doStore = funct === UInt(3)
+  // i r r rs1:source reg rs2:target addr
+  val doAdd = funct === UInt(4)
+  // i r r rs1:source reg rs2:target addr
+  val doMul = funct === UInt(5)
+  // val doAccum = funct === UInt(3)
+  val memRespTag = io.mem.resp.bits.tag(log2Up(outer.n)-1,0)
+  // -------------------------- new --------------------------------
+  val reg_write = cmd.bits.rs1(log2Up(outer.n)-1,0)
+  val value_read = regfile(cmd.bits.rs1)
+  val value_write = cmd.bits.rs2
+  val value_resp = value_read
+  //
+  def VIDLE      = UInt(0);
+  def VLOAD      = UInt(1); // int load
+  def VSTORE     = UInt(2); // int store
+  def VADD       = UInt(3);
+  def VMUL       = UInt(4);
+  val state = RegInit(0.U(8.W))
+  // val req_bits = Wire(UInt(width = 8))
+  //
+  val need_to_load = state === VLOAD || state === VADD || state === VMUL
+  val v_length = regfile(0)(log2Up(outer.n)-1,0)
+  val addr_delta = 8.U
+  val reg_addr_width = log2Up(outer.n)
+  val reg_tar_addr = RegInit(0.U(reg_addr_width.W))
+  val mem_req_addr = RegInit(0.U(xLen.W))
+  val mem_req_cnt = RegInit(0.U(16.W))
+  val mem_resp_addr = io.mem.resp.bits.tag(log2Up(outer.n)-1,0)
+  val mem_resp_cnt = RegInit(0.U(reg_addr_width.W))
+  val load_req_valid = need_to_load&& !busy(reg_tar_addr) && mem_req_cnt < v_length 
+  val store_req_valid = state === VSTORE && mem_req_cnt < v_length 
+  val load_done = mem_resp_cnt >= v_length
+  val store_done = mem_req_cnt >= v_length && io.mem.req.ready
+  val mem_cmd = RegInit(M_XRD)
+  var mem_req_valid = Mux(need_to_load,load_req_valid,store_req_valid)
+  val mem_req_data = regfile(reg_tar_addr)// for store
+  chisel3.dontTouch(load_req_valid)
+  chisel3.dontTouch(store_req_valid)
+  // write
+  when(cmd.fire() && doWrite){
+    regfile(reg_write) := value_write
+  }
+  //state machine
+  when(cmd.fire()){
+    reg_tar_addr := cmd.bits.rs1(log2Up(outer.n)-1,0)
+    mem_req_addr := cmd.bits.rs2
+    mem_req_cnt := 0.U
+    mem_resp_cnt := 0.U
+    when(doLoad){
+      state := VLOAD
+      mem_cmd := M_XRD
+    }.elsewhen(doStore){
+      state := VSTORE
+      mem_cmd := M_XWR
+    }.elsewhen(doAdd){
+      state := VADD
+      mem_cmd := M_XRD
+    }.elsewhen(doMul){
+      state := VMUL
+      mem_cmd := M_XRD
+    }
+    .otherwise{
+      state := VIDLE
+    }
+  }
+  // exec
+  when(state === VLOAD){
+    when(io.mem.req.fire()){
+      reg_tar_addr := reg_tar_addr + 1.U
+      mem_req_addr := mem_req_addr + addr_delta
+      mem_req_cnt := mem_req_cnt + 1.U
+      busy(reg_tar_addr) := Bool(true)
+    }
+    when(load_done){
+      state := VIDLE
+    }
+    when(io.mem.resp.valid){
+      mem_resp_cnt := mem_resp_cnt + 1.U;
+      regfile(memRespTag) := io.mem.resp.bits.data
+      busy(memRespTag) := Bool(false)
+    }
+  }
+  when(state === VSTORE){
+    when(io.mem.req.fire()){
+      reg_tar_addr := reg_tar_addr + 1.U
+      mem_req_addr := mem_req_addr + addr_delta
+      mem_req_cnt := mem_req_cnt + 1.U
+    }
+    when(store_done){
+      state := VIDLE
+    }
+  }
+  when(state === VADD){
+    when(io.mem.req.fire()){
+      reg_tar_addr := reg_tar_addr + 1.U
+      mem_req_addr := mem_req_addr + addr_delta
+      mem_req_cnt := mem_req_cnt + 1.U
+      busy(reg_tar_addr) := Bool(true)
+    }
+    when(load_done){
+      state := VIDLE
+    }
+    when(io.mem.resp.valid){
+      mem_resp_cnt := mem_resp_cnt + 1.U;
+      regfile(memRespTag) := regfile(memRespTag) + io.mem.resp.bits.data
+      busy(memRespTag) := Bool(false)
+    }
+  }
+  when(state === VMUL){
+    when(io.mem.req.fire()){
+      reg_tar_addr := reg_tar_addr + 1.U
+      mem_req_addr := mem_req_addr + addr_delta
+      mem_req_cnt := mem_req_cnt + 1.U
+      busy(reg_tar_addr) := Bool(true)
+    }
+    when(load_done){
+      state := VIDLE
+    }
+    when(io.mem.resp.valid){
+      mem_resp_cnt := mem_resp_cnt + 1.U;
+      regfile(memRespTag) := regfile(memRespTag) * io.mem.resp.bits.data
+      busy(memRespTag) := Bool(false)
+    }
+  }
+  // 
+
+  //Store
+  val addend = mem_req_addr
+  // ---------------------------------------------------------------
+
+  val doResp = cmd.bits.inst.xd
+  val stallReg = busy(reg_tar_addr)
+  val stallLoad = (doLoad || state === VLOAD) && !io.mem.req.ready
+  val stallResp = doResp && !io.resp.ready
+
+  cmd.ready := !stallReg && state === VIDLE && !stallResp
+    // command resolved if no stalls AND not issuing a load that will need a request
+
+  // PROC RESPONSE INTERFACE
+  io.resp.valid := cmd.valid && doResp && !stallReg && !stallLoad
+    // valid response if valid command, need a response, and no stalls
+  io.resp.bits.rd := cmd.bits.inst.rd
+    // Must respond with the appropriate tag or undefined behavior
+  // io.resp.bits.data := accum
+  io.resp.bits.data := value_resp
+    // Semantics is to always send out prior accumulator register value
+
+  // io.busy := cmd.valid || busy.reduce(_||_)
+  io.busy := cmd.valid || busy.reduce(_||_)
+    // Be busy when have pending memory requests or committed possibility of pending requests
+  io.interrupt := Bool(false)
+    // Set this true to trigger an interrupt on the processor (please refer to supervisor documentation)
+
+  // MEMORY REQUEST INTERFACE
+  // io.mem.req.valid := cmd.valid && doLoad && !stallReg && !stallResp
+  io.mem.req.valid := mem_req_valid
+  io.mem.req.bits.addr := addend
+  io.mem.req.bits.tag := reg_tar_addr
+
+  // io.mem.req.bits.cmd := M_XRD // perform a load (M_XWR for stores)
+  io.mem.req.bits.cmd := mem_cmd // perform a load (M_XWR for stores)
+  io.mem.req.bits.size := log2Ceil(8).U
+  io.mem.req.bits.signed := Bool(false)
+  io.mem.req.bits.data := mem_req_data
   io.mem.req.bits.phys := Bool(false)
   io.mem.req.bits.dprv := cmd.bits.status.dprv
 }
