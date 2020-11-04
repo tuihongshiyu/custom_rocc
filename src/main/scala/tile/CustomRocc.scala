@@ -26,6 +26,9 @@ class CustomRoccModuleImp(outer: CustomRocc)(implicit p: Parameters) extends Laz
   val regfile   = Mem(outer.n, UInt(width = xLen))
   val buffer_io = Module(new CustomBuffer(BufferConstant.IOBUFFER_BLOCK_N))
   val buffer_f  = Module(new CustomBuffer(8))
+  //-------------------------------------------new
+  val Custom_mesh = Module(new mesh(MeshParameter.df,MeshParameter.pe_latency,MeshParameter.meshRows,MeshParameter.meshColumns,MeshParameter.tileRows,MeshParameter.tileColumns))
+  //-------------------------------------------new
   val busy_regfile = Reg(init = Vec.fill(outer.n){0.U(2.W)})
   val busy_buffer_io = Reg(init = Vec.fill(BufferConstant.IOBUFFER_BLOCK_N){0.U(2.W)})
   def NOTBUSY      = UInt(0)
@@ -124,6 +127,13 @@ class CustomRoccModuleImp(outer: CustomRocc)(implicit p: Parameters) extends Laz
 
   val no_move_store_conflit = dma_mem_state_next =/= DMASTORE || dma_i_state =/= DMAMOVE
   val dma_mem_can_start = dma_mem_state === DMAWAIT && no_move_store_conflit && dma_mem_buffer_io_ready
+//-------------------------------new-------------------------------
+
+
+
+
+//-------------------------------new-------------------------------
+
   // --------------------------- buffer connection ---------------------------
   buffer_io.io.wr_en := dma_mem_state === DMALOAD && load_to_buffer_io 
   buffer_io.io.w_addr := dma_mem_rocc_addr
