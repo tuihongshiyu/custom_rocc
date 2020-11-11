@@ -1,4 +1,4 @@
-package systolicMatrix
+package freechips.rocketchip.tile
 
 import chisel3._
 import chisel3.utils._
