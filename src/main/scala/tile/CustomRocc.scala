@@ -23,14 +23,18 @@ class CustomRocc(opcodes: OpcodeSet, val n: Int = 16)(implicit p: Parameters) ex
 @chiselName
 class CustomRoccModuleImp(outer: CustomRocc)(implicit p: Parameters) extends LazyRoCCModuleImp(outer)
     with HasCoreParameters {
+  // -------------------------- submodule --------------------------
   val regfile   = Mem(outer.n, UInt(width = xLen))
-  val buffer_io = Module(new CustomBuffer(BufferConstant.IOBUFFER_BLOCK_N))
-  val buffer_f  = Module(new CustomBuffer(8))
-  val busy_regfile = Reg(init = Vec.fill(outer.n){0.U(2.W)})
-  val busy_buffer_io = Reg(init = Vec.fill(BufferConstant.IOBUFFER_BLOCK_N){0.U(2.W)})
-  def NOTBUSY      = UInt(0)
-  def DMABUSY      = UInt(1)
-  def MVBUSY       = UInt(2)
+
+  val buffer_io = Module(new CustomBuffer2Wr2Rd(BufferConstant.BLOCK_N_BUFFER_IO,64,64,64,256))
+  val buffer_f  = Module(new CustomBuffer(BufferConstant.BLOCK_N_BUFFER_F,64,64))
+  val buffer_m  = Module(new CustomBuffer2Rd(BufferConstant.BLOCK_N_BUFFER_M,256,256,64))
+  //-------------------------------------------new
+  // val Custom_mesh = Module(new mesh(MeshParameter.df,MeshParameter.pe_latency,MeshParameter.meshRows,MeshParameter.meshColumns,MeshParameter.tileRows,MeshParameter.tileColumns))
+  //-------------------------------------------new
+  val busy_regfile = Reg(init = Vec.fill(outer.n){false.B})
+  val busy_buffer_io = Reg(init = Vec.fill(BufferConstant.BLOCK_N_BUFFER_IO){false.B})
+  val busy_buffer_m = Reg(init = Vec.fill(BufferConstant.BLOCK_N_BUFFER_M){false.B})
   // 11:resv
   val cmd   = Queue(io.cmd)
   val funct = cmd.bits.inst.funct
@@ -74,43 +78,50 @@ class CustomRoccModuleImp(outer: CustomRocc)(implicit p: Parameters) extends Laz
   // regfile def
   val v_ls_length = regfile(0)
   val v_ls_mask   = regfile(1)(BufferConstant.ADDR_WIDTH-1,0)
-
+  val v_mat_n     = regfile(2)
   val v_mv_length = regfile(4)
 
   // constant
   def reg_addr_width = log2Up(outer.n)
-  def reg_index_shift_bits = log2Up(xLen/8)
-  def block_reg_ratio = log2Up(BufferConstant.BLOCK_WIDTH/xLen)
-  def cnt2block(cnt:UInt) = cnt >> block_reg_ratio
-  def addr2block(addr_begin:UInt) = (addr_begin & 0x0000FFFF.U) >> (block_reg_ratio + reg_index_shift_bits)
-  def addr2reg(addr_begin:UInt)  = (addr_begin & 0x0000FFFF.U) >> reg_index_shift_bits
+  def reg2byte_shift_bits = log2Up(xLen/8)
+  def block_divide_reg = BufferConstant.BLOCK_WIDTH/xLen
+  def block2reg_shift_bits = log2Up(block_divide_reg)
+  def cnt2block(cnt:UInt) = cnt >> block2reg_shift_bits
+  def addr2block(addr_begin:UInt) = (addr_begin & 0x0000FFFF.U) >> (block2reg_shift_bits + reg2byte_shift_bits)
+  def addr2reg(addr_begin:UInt)  = (addr_begin & 0x0000FFFF.U) >> reg2byte_shift_bits
+  def mat_row_width = MatC.MAX_N * MatC.WIDTH
+  def mat_row_divide_reg = mat_row_width / xLen
   val core_temp_rs1 = RegInit(0.U(xLen.W))
   val core_temp_rs2 = RegInit(0.U(xLen.W))
 
   // dma mem control register
+  val buffer_io_wr_ready_cnt = RegInit(0.U((log2Up(BufferConstant.BLOCK_N_BUFFER_IO)+1).W))
+  val dma_mem_req_mat_max = Wire(UInt(width = 16))
   val dma_mem_rocc_addr = RegInit(0.U(xLen.W))
   val dma_mem_req_cnt = RegInit(0.U(16.W))
   val dma_mem_resp_cnt = RegInit(0.U(16.W))
   val dma_mem_req_addr = RegInit(0.U(xLen.W))
   val dma_mem_req_reg_index = addr2reg(dma_mem_rocc_addr) + dma_mem_req_cnt
-  val dma_mem_load_done = dma_mem_resp_cnt >= v_ls_length
+  val dma_mem_load_done = buffer_io_wr_ready_cnt >= v_mat_n//dma_mem_resp_cnt >= v_ls_length
   val dma_mem_store_done = dma_mem_resp_cnt >= v_ls_length// && io.mem.req.ready
-  val dma_mem_load_req_valid = dma_mem_state === DMALOAD && dma_mem_req_cnt < v_ls_length 
+  val dma_mem_load_req_valid = dma_mem_state === DMALOAD && dma_mem_req_cnt < v_ls_length && dma_mem_req_cnt < dma_mem_req_mat_max
   val dma_mem_store_req_valid = dma_mem_state === DMASTORE && dma_mem_req_cnt < v_ls_length 
-  val dma_mem_buffer_io_ready = busy_buffer_io(addr2block(dma_mem_rocc_addr)) === NOTBUSY && busy_buffer_io(addr2block(dma_mem_rocc_addr) + cnt2block(v_ls_length) - 1.U) === NOTBUSY
+  val dma_mem_buffer_io_block_begin = addr2block(dma_mem_rocc_addr)
+  val dma_mem_buffer_io_block_end = dma_mem_buffer_io_block_begin + cnt2block(v_ls_length) - 1.U
+  val dma_mem_buffer_io_ready = !busy_buffer_io(dma_mem_buffer_io_block_begin) && !busy_buffer_io(dma_mem_buffer_io_block_end)
   // dma0 mem control register
   val mem_dma_start = dma_mem_state === DMAIDLE && (core_state === VSTORE || core_state === VLOAD)
-  val buffer_io_block_temp = RegInit(0.U(BufferConstant.BLOCK_WIDTH.W))
   // switch
   val load_to_buffer_io = dma_mem_rocc_addr >= RoccAddr.ADDR_IOBUFFER.U && dma_mem_rocc_addr < RoccAddr.ADDR_FBUFFER.U
   val load_to_regfile = dma_mem_rocc_addr < RoccAddr.ADDR_IOBUFFER.U
   val sw_buffer_io_rd = dma_mem_state === DMASTORE && load_to_buffer_io // 1:mem store 0:move to buffer_f
 
+  
   // buffer_io
   def in_buffer_io(addr:UInt) = addr >= RoccAddr.ADDR_IOBUFFER.U && addr < RoccAddr.ADDR_FBUFFER.U
   val buffer_io_rden_store = dma_mem_state === DMASTORE && load_to_buffer_io && dma_mem_req_cnt < v_ls_length
   val buffer_io_rden_move = Wire(Bool())
-
+  dma_mem_req_mat_max := (v_mat_n * v_mat_n * MatC.WIDTH.U / xLen.U) * (buffer_io_wr_ready_cnt + 1.U)
 
   // buffer_f
   def in_buffer_f(addr:UInt) = addr >= RoccAddr.ADDR_FBUFFER.U && addr < RoccAddr.ADDR_WBUFFER.U
@@ -119,29 +130,36 @@ class CustomRoccModuleImp(outer: CustomRocc)(implicit p: Parameters) extends Laz
   val dma_i_addr_src = RegInit(0.U(xLen.W))
   val dma_i_addr_des = RegInit(0.U(xLen.W))
   val dma_i_move_done = dma_i_move_cnt >= v_mv_length
-  val dma_i_buffer_io_ready = busy_buffer_io(addr2block(dma_i_addr_src)) === NOTBUSY && busy_buffer_io(addr2block(dma_i_addr_src) + cnt2block(v_mv_length) - 1.U) === NOTBUSY
+  val dma_i_buffer_io_ready = !busy_buffer_io(addr2block(dma_i_addr_src)) && !busy_buffer_io(addr2block(dma_i_addr_src) + cnt2block(v_mv_length) - 1.U)
   val dma_i_can_move = dma_i_state === DMAWAIT && dma_mem_state =/= DMASTORE && dma_i_buffer_io_ready 
 
   val no_move_store_conflit = dma_mem_state_next =/= DMASTORE || dma_i_state =/= DMAMOVE
   val dma_mem_can_start = dma_mem_state === DMAWAIT && no_move_store_conflit && dma_mem_buffer_io_ready
+  // buffer_f
+  //-------------------------------new-------------------------------
+  
+
+
+
+  //-------------------------------new-------------------------------
   // --------------------------- buffer connection ---------------------------
-  buffer_io.io.wr_en := dma_mem_state === DMALOAD && load_to_buffer_io 
+  buffer_io.io.w_en := dma_mem_state === DMALOAD && load_to_buffer_io 
   buffer_io.io.w_addr := dma_mem_rocc_addr
   buffer_io.io.w_data := io.mem.resp.bits.data
   buffer_io.io.w_valid := io.mem.resp.valid
   // buffer_io.io.w_ready :=  [todo] busy
-  buffer_io.io.rd_en := Mux(sw_buffer_io_rd,buffer_io_rden_store,buffer_io_rden_move)
+  buffer_io.io.r_en := Mux(sw_buffer_io_rd,buffer_io_rden_store,buffer_io_rden_move)
   buffer_io.io.r_addr := Mux(sw_buffer_io_rd,dma_mem_rocc_addr,dma_i_addr_src)
   buffer_io.io.r_ready := Mux(sw_buffer_io_rd,io.mem.req.ready,buffer_f.io.w_ready)
   //
   buffer_io_rden_move := dma_i_state === DMAMOVE && dma_i_move_cnt < v_mv_length
-  buffer_f.io.wr_en   := dma_i_state === DMAMOVE
+  buffer_f.io.w_en   := dma_i_state === DMAMOVE
   buffer_f.io.w_addr  := dma_i_addr_des
   buffer_f.io.w_data  := buffer_io.io.r_data
   buffer_f.io.w_valid := buffer_io.io.r_valid
 
   // mem_io
-  def addr_delta = 8.U// 64 bytes or 8 bytes
+  def addr_delta = 8.U// 8 bytes
   val mem_cmd = RegInit(M_XRD)
   var mem_req_valid = Mux(dma_mem_state === DMAIDLE || dma_mem_state === DMAWAIT,false.B,
                           Mux(dma_mem_state === DMALOAD,dma_mem_load_req_valid,
@@ -153,24 +171,28 @@ class CustomRoccModuleImp(outer: CustomRocc)(implicit p: Parameters) extends Laz
   val mem_req_size = log2Ceil(8).U
 
   // busy management
-  for(r <- 0 until BufferConstant.IOBUFFER_BLOCK_N){
+  for(r <- 0 until BufferConstant.BLOCK_N_BUFFER_IO){
     when(dma_mem_can_start
       && in_buffer_io(core_temp_rs1) 
       && r.U >= addr2block(core_temp_rs1)
       && r.U < addr2block(core_temp_rs1) + cnt2block(v_ls_length)){
-      busy_buffer_io(r) := DMABUSY
+      busy_buffer_io(r) := true.B
     }
     when(dma_i_can_move
     && r.U >= addr2block(dma_i_addr_src)
     && r.U < addr2block(dma_i_addr_src) + cnt2block(v_mv_length)){
-      busy_buffer_io(r) := MVBUSY
+      busy_buffer_io(r) := true.B
     }
   }
   // debug
+
+  val mat_reshape = regfile(3)(0)
+  buffer_io.io.ex_r_en := mat_reshape
+  buffer_io.io.buffer_mat_n := v_mat_n
+  chisel3.dontTouch(buffer_io.io)
+
   val debug_port = Wire(Vec(4, UInt(width = xLen)))
   debug_port(0) := addr2block(dma_i_addr_src)
-  debug_port(1) := cnt2block(v_mv_length)
-  debug_port(2) := addr2block(dma_i_addr_src) + cnt2block(v_mv_length) - 1.U
   val debug_io_mem_req_fire = io.mem.req.valid && io.mem.req.ready
   chisel3.dontTouch(debug_port)
   chisel3.dontTouch(busy_buffer_io)
@@ -208,9 +230,10 @@ class CustomRoccModuleImp(outer: CustomRocc)(implicit p: Parameters) extends Laz
   when(mem_dma_start){
     dma_mem_rocc_addr := core_temp_rs1 // get rocc addr
     dma_mem_req_addr := core_temp_rs2 // get memory addr
+    buffer_io_wr_ready_cnt := 0.U
     dma_mem_req_cnt := 0.U
     dma_mem_resp_cnt := 0.U
-    busy_regfile(0) := DMABUSY
+    busy_regfile(0) := true.B
     dma_mem_state := DMAWAIT
     when(core_state === VLOAD){
       dma_mem_state_next := DMALOAD
@@ -229,18 +252,21 @@ class CustomRoccModuleImp(outer: CustomRocc)(implicit p: Parameters) extends Laz
   }
   
   when(dma_mem_state === DMALOAD){
+    when(buffer_io.io.w_ready){
+        buffer_io_wr_ready_cnt := buffer_io_wr_ready_cnt + 1.U
+    }
     when(io.mem.req.fire()){
       dma_mem_req_addr := dma_mem_req_addr + addr_delta
       dma_mem_req_cnt := dma_mem_req_cnt + 1.U
     }
     when(dma_mem_load_done){
       dma_mem_state := DMAIDLE
-      busy_regfile(0) := NOTBUSY
+      busy_regfile(0) := false.B
     }
     when(io.mem.resp.valid){
       dma_mem_resp_cnt := dma_mem_resp_cnt + 1.U
-      when(dma_mem_resp_cnt(block_reg_ratio-1,0) === (BufferConstant.BLOCK_WIDTH/xLen).U - 1.U){
-        busy_buffer_io(addr2block(dma_mem_rocc_addr) + cnt2block(dma_mem_resp_cnt)) := NOTBUSY
+      when(dma_mem_resp_cnt(block2reg_shift_bits-1,0) === block_divide_reg.U - 1.U){
+        busy_buffer_io(dma_mem_buffer_io_block_begin + buffer_io_wr_ready_cnt) := false.B
       }
       when(load_to_regfile){
         regfile(addr2reg(dma_mem_rocc_addr) + dma_mem_resp_cnt) := io.mem.resp.bits.data
@@ -253,8 +279,8 @@ class CustomRoccModuleImp(outer: CustomRocc)(implicit p: Parameters) extends Laz
     when(io.mem.req.fire()){
       dma_mem_req_addr := dma_mem_req_addr + addr_delta
       dma_mem_req_cnt := dma_mem_req_cnt + 1.U
-      when(dma_mem_req_cnt(block_reg_ratio-1,0) === (BufferConstant.BLOCK_WIDTH/xLen).U - 1.U){
-        busy_buffer_io(addr2block(dma_mem_rocc_addr) + cnt2block(dma_mem_req_cnt)) := NOTBUSY
+      when(dma_mem_req_cnt(block2reg_shift_bits-1,0) === block_divide_reg.U - 1.U){
+        busy_buffer_io(dma_mem_buffer_io_block_begin + cnt2block(dma_mem_req_cnt)) := false.B
       }
     }
     when(io.mem.resp.valid){
@@ -262,7 +288,7 @@ class CustomRoccModuleImp(outer: CustomRocc)(implicit p: Parameters) extends Laz
     }
     when(dma_mem_store_done){
       dma_mem_state := DMAIDLE
-      busy_regfile(0) := NOTBUSY
+      busy_regfile(0) := false.B
     }
   }
   //--------------------------- _i_dma ---------------------------
@@ -270,7 +296,7 @@ class CustomRoccModuleImp(outer: CustomRocc)(implicit p: Parameters) extends Laz
     dma_i_addr_des := core_temp_rs1
     dma_i_addr_src := core_temp_rs2
     dma_i_move_cnt := 0.U
-    busy_regfile(4) := DMABUSY
+    busy_regfile(4) := true.B
     dma_i_state := DMAWAIT
     when(core_state === VMOV){
       dma_i_state_next := DMAMOVE
@@ -286,13 +312,13 @@ class CustomRoccModuleImp(outer: CustomRocc)(implicit p: Parameters) extends Laz
   when(dma_i_state === DMAMOVE){
     when(buffer_f.io.w_ready && buffer_f.io.w_valid){
       dma_i_move_cnt := dma_i_move_cnt + 1.U
-      when(dma_i_move_cnt(block_reg_ratio-1,0) === (BufferConstant.BLOCK_WIDTH/xLen).U - 1.U){
-        busy_buffer_io(addr2block(dma_i_addr_src) + cnt2block(dma_i_move_cnt)) := NOTBUSY
+      when(dma_i_move_cnt(block2reg_shift_bits-1,0) === block_divide_reg.U - 1.U){
+        busy_buffer_io(addr2block(dma_i_addr_src) + cnt2block(dma_i_move_cnt)) := false.B
       }
     }
     when(dma_i_move_done){
       dma_i_state := DMAIDLE
-      busy_regfile(4) := NOTBUSY
+      busy_regfile(4) := false.B
     }
   }
 
@@ -300,7 +326,6 @@ class CustomRoccModuleImp(outer: CustomRocc)(implicit p: Parameters) extends Laz
 
   // --------------------------- rocc resp ---------------------------
   val doResp = cmd.bits.inst.xd
-  // val stallReg = busy_regfile(cmd.bits.rs1) =/= 0.U
   val stallReg = false.B
   val stallLoad = dma_mem_state =/= DMAIDLE
   val stallResp = doResp && !io.resp.ready

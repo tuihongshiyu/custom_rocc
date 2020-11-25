@@ -4,9 +4,16 @@ object BufferConstant{
     def BLOCK_WIDTH = 4096
     def DATA_WIDTH = 4096
     def ADDR_WIDTH = 32
-    def IOBUFFER_BLOCK_N = 8
+    def BLOCK_N_BUFFER_IO = 8
+    def BLOCK_N_BUFFER_F = 8
+    def BLOCK_N_BUFFER_M = 8
+
 }
 
+object MatC{
+    def MAX_N = 8
+    def WIDTH = 64
+}
 
 object RoccAddr{
     def ADDR_REGFILE  = 0x00000000 // 0x0 - 0x100
